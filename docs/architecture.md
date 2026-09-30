@@ -1,5 +1,8 @@
 # Architecture and operations
 
+For the new multi-user platform, see [hosted architecture](platform.md). The
+sections below describe only the original local studio and its API.
+
 `schemas/generation.py` validates all API and UI requests. `presets.py` separates generation dimensions from export sizes and selects the model profile. `generator.py` owns one backend and a nonblocking lock that covers loading, adapter mutation, inference, upscaling and artifact persistence. Concurrent API generation/upscale calls return 429; Gradio serializes work through its queue.
 
 `pipelines/flux_pipeline.py` imports PyTorch/Diffusers lazily. It switches models by releasing the previous pipeline, uses supported CUDA BF16 or FP16, and uses conservative FP32 on MPS/CPU. CUDA model CPU offload is configurable. VAE tiling reduces decode pressure. Adapters are registered locally and must match the model ID; request data cannot choose filesystem locations.

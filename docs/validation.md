@@ -29,3 +29,24 @@ The restricted test environment's socket permissions blocked an initial in-proce
 - Hosted CI runs (workflow supplied; check its status on GitHub).
 
 Accordingly, mocked workflow tests establish application behavior, not model quality or end-to-end hardware compatibility. No trained model or dataset is bundled.
+
+
+## Hosted platform 0.3 validation
+
+Local Python 3.12: 62 tests passed (23 platform checks plus 39 existing checks),
+with no model weights or paid provider calls. Ruff lint/format, Python compile,
+JavaScript syntax and YAML parsing passed. One upstream Starlette/httpx
+compatibility deprecation warning remains. Browser startup in the execution
+sandbox was blocked by socket permissions; separate GitHub Actions browser and
+Postgres jobs now exercise those environments and publish browser screenshots.
+Check the actual workflow results before treating those gates as passed.
+
+Platform coverage includes CSRF/owner enforcement, tenant isolation, concurrent
+credit debit, retries, worker leases, unknown provider outcomes, refunds, signed
+webhook rejection, payment replay, checkout reuse, invoice-price attribution,
+caption review, immutable training snapshots, adapter promotion, upload limits,
+provider request contracts and usage aggregation with missing token reports.
+
+No GPU generation, training, live Stripe checkout, S3 integration, load test,
+provider-cost audit or photorealism benchmark was run. See `docs/platform.md` for
+launch requirements and the distinction between credits, tokens and worker time.
