@@ -1,6 +1,7 @@
 """Browser smoke test against an isolated local app; never calls paid providers."""
 
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -57,14 +58,17 @@ try:
             time.sleep(0.1)
         else:
             raise RuntimeError("Preview did not start")
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import expect, sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
-        page.goto("http://127.0.0.1:8000/", wait_until="networkidle")
+        response = page.goto("http://127.0.0.1:8000/", wait_until="networkidle")
+        assert response is not None
+        policy = response.headers.get("content-security-policy", "")
+        assert "script-src 'self'" in policy and "'unsafe-eval'" not in policy
         page.screenshot(path="test-results/studio-desktop.png", full_page=True)
         page.locator("#auth-open").click()
         page.locator("#email").fill("preview@example.com")
@@ -78,7 +82,10 @@ try:
         page.locator("#dataset-name").fill("Browser test collection")
         page.locator("#dataset-rights").fill("Original reference material for browser validation")
         page.locator("#dataset-form button").click()
-        page.wait_for_function("document.querySelector('#dataset-select').options.length > 0")
+        # Locator assertions retry without compiling a string inside the page.
+        # Options are attached but not necessarily visible when a select is closed.
+        expect(page.locator("#dataset-select option")).to_have_count(1)
+        expect(page.locator("#dataset-select")).to_have_value(re.compile(r"^[0-9a-f]{32}$"))
         page.locator("#asset-files").set_input_files(
             {"name": "notes.txt", "mimeType": "text/plain", "buffer": b"Natural side lighting and realistic ceramics."}
         )
@@ -92,10 +99,10 @@ try:
         page.locator("#effort").select_option("high")
         page.locator("#resolution").select_option("8K")
         page.locator("#prompt").fill("A handmade ceramic vase in natural window light")
-        page.wait_for_function("document.querySelector('#quote').textContent.includes('8192')")
+        expect(page.locator("#quote")).to_contain_text("8192")
         page.set_viewport_size({"width": 390, "height": 844})
         page.screenshot(path="test-results/studio-mobile.png", full_page=True)
-        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        assert page.locator("html").evaluate("(root) => root.scrollWidth <= window.innerWidth")
         assert not errors, errors
         print(
             "Browser checks passed: owner login, dashboard, dataset creation/upload, billing view, model/effort/resolution quote, mobile overflow, no JS errors."
