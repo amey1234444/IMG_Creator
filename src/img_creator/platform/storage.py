@@ -49,3 +49,32 @@ class Storage:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         else:
             Path(self.root / key).unlink(missing_ok=True)
+
+    def put_file(self, key, path):
+        """Stream large checkpoints without loading the complete payload into RAM."""
+        import shutil
+
+        self.validate(key)
+        if self.client:
+            self.client.upload_file(str(path), self.bucket, key)
+        else:
+            destination = self.root / key
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
+            try:
+                shutil.copyfile(path, temporary)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def get_file(self, key, path):
+        """Download a private object to an operator-controlled destination."""
+        import shutil
+
+        self.validate(key)
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if self.client:
+            self.client.download_file(self.bucket, key, str(path))
+        else:
+            shutil.copyfile(self.root / key, path)

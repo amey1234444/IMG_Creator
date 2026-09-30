@@ -8,7 +8,7 @@ import stripe
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, UploadFile, File, Header
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select, update, func, delete
 from sqlalchemy.exc import IntegrityError
 from .config import PlatformSettings
@@ -19,6 +19,7 @@ from .storage import Storage
 from .jobs import submit, serialize
 from .datasets import ingest, snapshot_run
 from . import billing
+from .db import AssetSource, DatasetVersion, DatasetVersionItem, TrainingArtifact
 from .metrics import usage_rows, empty_usage
 from .middleware import BodyLimitMiddleware, BodyTooLarge
 
@@ -56,6 +57,7 @@ class NewDataset(Strict):
 class ReviewAsset(Strict):
     caption: str = Field(default="", max_length=4000)
     approved: bool = False
+    group_id: str | None = Field(default=None, min_length=1, max_length=120, pattern=r"^[a-zA-Z0-9_.-]+$")
 
 
 class TrainConfig(Strict):
@@ -64,6 +66,23 @@ class TrainConfig(Strict):
     rank: Literal[8, 16, 32] = 16
     learning_rate: float = Field(default=0.0001, ge=0.000001, le=0.001)
     seed: int = Field(default=42, ge=0, le=2**32 - 1)
+
+    resolution: Literal[512, 768, 1024] = 1024
+    gradient_accumulation: int = Field(default=4, ge=1, le=16)
+    lr_scheduler: Literal["constant", "cosine", "linear"] = "cosine"
+    warmup_steps: int = Field(default=50, ge=0, le=500)
+    validation_prompt: str = Field(
+        default="A detailed studio photograph of the trained subject in natural light", min_length=10, max_length=1000
+    )
+    validation_epochs: int = Field(default=5, ge=1, le=100)
+    validation_fraction: float = Field(default=0.1, ge=0.05, le=0.3)
+    split_seed: int = Field(default=42, ge=0, le=2**32 - 1)
+
+    @model_validator(mode="after")
+    def schedule_valid(self):
+        if self.warmup_steps >= self.steps:
+            raise ValueError("Warmup must be shorter than training")
+        return self
 
 
 class Evaluation(Strict):
@@ -121,7 +140,13 @@ def create_app(settings=None, db=None, storage=None):
     settings = settings or PlatformSettings()
     db = db or Database(settings.database_url)
     storage = storage or Storage(settings)
-    app = FastAPI(title="IMG Creator Studio", version="0.3.0")
+    app = FastAPI(
+        title="IMG Creator Studio",
+        version="0.4.0",
+        docs_url="/docs" if settings.expose_api_docs else None,
+        redoc_url=None,
+        openapi_url="/openapi.json" if settings.expose_api_docs else None,
+    )
     app.state.db, app.state.settings, app.state.storage = db, settings, storage
     app.add_middleware(BodyLimitMiddleware, limit=settings.upload_limit + 1024 * 1024)
 
@@ -167,7 +192,8 @@ def create_app(settings=None, db=None, storage=None):
             ):
                 raise HTTPException(403, "Refresh the page and try again")
             request.state.session = session
-            return user
+        rate_limit(db, "api-user", user.id, settings.api_requests_per_minute, 60)
+        return user
 
     def owner(user=Depends(current)):
         if user.role != "owner":
@@ -322,6 +348,7 @@ def create_app(settings=None, db=None, storage=None):
 
     @app.get("/api/jobs/{job_id}/image")
     def image(job_id: str, user=Depends(current)):
+        rate_limit(db, "image-download", user.id, 60, 60)
         with db.transaction() as s:
             item = owned_job(s, job_id, user)
             if item.status != "succeeded":
@@ -485,6 +512,7 @@ def create_app(settings=None, db=None, storage=None):
 
     @app.post("/api/admin/datasets/{dataset_id}/assets")
     def upload(dataset_id: str, file: UploadFile = File(), user=Depends(owner)):
+        rate_limit(db, "dataset-upload", user.id, 120, 3600)
         data = file.file.read(settings.upload_limit + 1)
         if len(data) > settings.upload_limit:
             raise HTTPException(413, "File exceeds 25 MB; use the large-dataset CLI for bulk collections")
@@ -507,7 +535,19 @@ def create_app(settings=None, db=None, storage=None):
     def assets(dataset_id: str, user=Depends(owner)):
         with db.transaction() as s:
             return [
-                asset_json(a)
+                {
+                    **asset_json(a),
+                    "source": (
+                        {
+                            "group_id": source.group_id,
+                            "quality": source.quality,
+                            "original_sha256": source.original_sha256,
+                            "original_bytes": source.original_bytes,
+                        }
+                        if (source := s.get(AssetSource, a.id))
+                        else None
+                    ),
+                }
                 for a in s.scalars(
                     select(Asset).where(Asset.dataset_id == dataset_id).order_by(Asset.created).limit(2000)
                 )
@@ -529,15 +569,40 @@ def create_app(settings=None, db=None, storage=None):
                 raise HTTPException(404, "Asset not found")
             if a.kind == "image" and body.approved and not body.caption.strip():
                 raise HTTPException(422, "Caption is required before approval")
+            if body.group_id:
+                source = s.get(AssetSource, a.id)
+                if source:
+                    source.group_id = body.group_id
+                else:
+                    s.add(
+                        AssetSource(
+                            asset_id=a.id,
+                            group_id=body.group_id,
+                            original_key=a.key,
+                            original_sha256=a.sha256,
+                            original_bytes=len(storage.get(a.key)),
+                            quality={"legacy_normalized_source": True},
+                        )
+                    )
             a.caption, a.approved = body.caption.strip(), body.approved
             s.add(Audit(actor=user.id, action="asset_review", target=a.id, detail=body.model_dump()))
         return {"ok": True}
 
     @app.post("/api/admin/training")
     def training(body: TrainConfig, user=Depends(owner)):
+        rate_limit(db, "training-start", user.id, 6, 3600)
         with db.transaction() as s:
-            if not s.get(Dataset, body.dataset_id):
+            if not s.scalar(select(Dataset).where(Dataset.id == body.dataset_id).with_for_update()):
                 raise HTTPException(404, "Dataset not found")
+            if (
+                s.scalar(
+                    select(func.count())
+                    .select_from(TrainingRun)
+                    .where(TrainingRun.dataset_id == body.dataset_id, TrainingRun.status.in_(["queued", "running"]))
+                )
+                >= 3
+            ):
+                raise HTTPException(429, "This dataset already has three active training runs")
             run = snapshot_run(s, body.dataset_id, body.model_dump())
             s.add(Audit(actor=user.id, action="training_queued", target=run.id))
             s.flush()
@@ -577,6 +642,59 @@ def create_app(settings=None, db=None, storage=None):
                 media_type="application/octet-stream",
                 headers={"Content-Disposition": f'attachment; filename="{run.id}.safetensors"'},
             )
+
+    @app.get("/api/admin/datasets/{dataset_id}/versions")
+    def versions(dataset_id: str, user=Depends(owner)):
+        with db.transaction() as s:
+            return [
+                {
+                    "id": v.id,
+                    "sha256": v.sha256,
+                    "created": v.created,
+                    "settings": v.settings,
+                    "images": s.scalar(
+                        select(func.count())
+                        .select_from(DatasetVersionItem)
+                        .where(DatasetVersionItem.version_id == v.id)
+                    ),
+                }
+                for v in s.scalars(
+                    select(DatasetVersion)
+                    .where(DatasetVersion.dataset_id == dataset_id)
+                    .order_by(DatasetVersion.created.desc())
+                    .limit(100)
+                )
+            ]
+
+    @app.get("/api/admin/dataset-versions/{version_id}/manifest")
+    def version_manifest(version_id: str, user=Depends(owner)):
+        with db.transaction() as s:
+            if not s.get(DatasetVersion, version_id):
+                raise HTTPException(404, "Dataset version not found")
+            return [
+                {
+                    "asset_id": i.asset_id,
+                    "caption": i.caption,
+                    "group_id": i.group_id,
+                    "split": i.split,
+                    "key": i.key,
+                    "sha256": i.sha256,
+                }
+                for i in s.scalars(select(DatasetVersionItem).where(DatasetVersionItem.version_id == version_id))
+            ]
+
+    @app.get("/api/admin/training/{run_id}/files")
+    def training_files(run_id: str, user=Depends(owner)):
+        with db.transaction() as s:
+            return [
+                {"path": a.path, "key": a.key, "sha256": a.sha256, "bytes": a.size_bytes}
+                for a in s.scalars(
+                    select(TrainingArtifact)
+                    .where(TrainingArtifact.run_id == run_id)
+                    .order_by(TrainingArtifact.path)
+                    .limit(2000)
+                )
+            ]
 
     @app.get("/api/admin/audit")
     def audit(user=Depends(owner)):

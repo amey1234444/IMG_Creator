@@ -50,3 +50,14 @@ provider request contracts and usage aggregation with missing token reports.
 No GPU generation, training, live Stripe checkout, S3 integration, load test,
 provider-cost audit or photorealism benchmark was run. See `docs/platform.md` for
 launch requirements and the distinction between credits, tokens and worker time.
+
+
+## Training lifecycle 0.4
+
+Local suite: 69 tests passed on Python 3.12. Added coverage for additive schema
+upgrade preservation/idempotency, immutable dataset captions and grouped splits,
+original-byte hashes, account rate limits, disabled API docs, checkpoint archival
+and verified restoration, failed-training log/workspace preservation, training
+parameter forwarding and model-specific adapter influence. Lint, formatting,
+compile and JavaScript syntax checks passed. GPU quality/training and actual
+cloud storage recovery remain hardware/infrastructure acceptance tasks.

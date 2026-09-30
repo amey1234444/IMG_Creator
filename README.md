@@ -1,8 +1,11 @@
 # IMG Creator
 
-## Hosted subscription platform — version 0.3
+## Hosted subscription platform — version 0.4
 
-The new public studio adds user accounts, private galleries, model/effort/resolution
+See the new [training-first workflow, schema and recovery guide](docs/training-lifecycle.md)
+for versioned datasets, grouped splits, training controls and preserved artifacts.
+
+The public studio adds user accounts, private galleries, model/effort/resolution
 selection, credit quotes, Stripe subscription hooks, a durable job queue, an owner
 console, dataset review and a separate GPU LoRA worker. Start with the
 [hosted platform and Render deployment guide](docs/platform.md). The

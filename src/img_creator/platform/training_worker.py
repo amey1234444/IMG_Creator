@@ -6,12 +6,13 @@ import json
 import logging
 from pathlib import Path
 import subprocess
-import tempfile
+from threading import Event, Thread
 import time
 from sqlalchemy import select, update
 from .config import PlatformSettings
 from .db import Database, TrainingRun, uid
 from .storage import Storage
+from .artifacts import archive_outputs
 
 log = logging.getLogger(__name__)
 
@@ -22,9 +23,9 @@ def training_command(config, checkout, dataset, output):
     options = {
         "pretrained_model_name_or_path": "black-forest-labs/FLUX.2-klein-base-4B",
         "instance_prompt": "a detailed image",
-        "resolution": 1024,
+        "resolution": config.get("resolution", 1024),
         "train_batch_size": 1,
-        "gradient_accumulation_steps": 4,
+        "gradient_accumulation_steps": config.get("gradient_accumulation", 4),
         "gradient_checkpointing": True,
         "learning_rate": config["learning_rate"],
         "max_train_steps": config["steps"],
@@ -33,6 +34,11 @@ def training_command(config, checkout, dataset, output):
         "mixed_precision": "bf16",
         "rank": config["rank"],
         "seed": config["seed"],
+        "use_aspect_ratio_buckets": True,
+        "lr_scheduler": config.get("lr_scheduler", "cosine"),
+        "lr_warmup_steps": config.get("warmup_steps", 50),
+        "validation_prompt": config.get("validation_prompt", "A detailed image in natural light"),
+        "validation_epochs": config.get("validation_epochs", 5),
     }
     cmd = command(options, checkout, dataset, output)
     cmd[cmd.index("--report_to") + 1] = "tensorboard"
@@ -55,7 +61,7 @@ def tensorboard_metrics(output):
     return metrics
 
 
-def train_one(db, storage, checkout, timeout_hours=12):
+def train_one(db, storage, checkout, timeout_hours=12, work_dir=None):
     with db.transaction() as s:
         # Interrupted training is failed for explicit resubmission, never invisibly restarted.
         s.execute(
@@ -82,83 +88,113 @@ def train_one(db, storage, checkout, timeout_hours=12):
         s.refresh(run)
     began = time.monotonic()
     process = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="img-train-") as temporary:
-            root = Path(temporary)
-            dataset, output = root / "dataset", root / "output"
-            dataset.mkdir()
-            output.mkdir()
-            manifest = []
-            for item in run.snapshot:
-                if item["split"] != "train":
-                    continue
-                data = storage.get(item["key"])
-                if hashlib.sha256(data).hexdigest() != item["sha256"]:
-                    raise ValueError("Dataset snapshot integrity check failed")
-                filename = item["id"] + ".png"
-                (dataset / filename).write_bytes(data)
-                manifest.append({"file_name": filename, "text": item["caption"]})
-            (dataset / "metadata.jsonl").write_text("\n".join(json.dumps(x) for x in manifest) + "\n")
-            cmd = training_command(run.config, checkout, dataset, output)
-            with (root / "train.log").open("wb") as log_file:
-                process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
-                while process.poll() is None:
-                    if time.monotonic() - began > timeout_hours * 3600:
-                        raise TimeoutError("Training exceeded the configured runtime budget")
-                    metrics = {
-                        "elapsed_seconds": round(time.monotonic() - began, 1),
-                        "scalars": tensorboard_metrics(output),
-                        "train_images": len(manifest),
-                        "validation_images": len(run.snapshot) - len(manifest),
-                    }
-                    with db.transaction() as s:
-                        count = s.execute(
-                            update(TrainingRun)
-                            .where(
-                                TrainingRun.id == run.id,
-                                TrainingRun.status == "running",
-                                TrainingRun.lease_token == token,
-                            )
-                            .values(metrics=metrics, lease_until=time.time() + 180)
-                        ).rowcount
-                        if not count:
-                            raise RuntimeError("Training lease lost")
-                    time.sleep(5)
-            log_key = f"training/{run.id}/train.log"
-            # Keep the end of the log, bounded to 2 MB.
-            with (root / "train.log").open("rb") as stream:
-                stream.seek(max(0, stream.seek(0, 2) - 2_000_000))
-                storage.put(log_key, stream.read())
-            if process.returncode:
-                raise RuntimeError("GPU training failed; see the private training log")
-            weights = output / "pytorch_lora_weights.safetensors"
-            from safetensors import safe_open
+    root = Path(work_dir or PlatformSettings().training_work_dir) / run.id
+    stopped, lease_errors = Event(), []
 
-            with safe_open(str(weights), framework="pt", device="cpu") as tensors:
-                if not list(tensors.keys()):
-                    raise ValueError("Empty adapter artifact")
-            data = weights.read_bytes()
-            key = f"training/{run.id}/adapter.safetensors"
-            storage.put(key, data)
-            metrics = {
-                "elapsed_seconds": round(time.monotonic() - began, 1),
-                "scalars": tensorboard_metrics(output),
-                "train_images": len(manifest),
-                "validation_images": len(run.snapshot) - len(manifest),
-                "log_key": log_key,
-            }
-            with db.transaction() as s:
-                s.execute(
-                    update(TrainingRun)
-                    .where(TrainingRun.id == run.id, TrainingRun.status == "running", TrainingRun.lease_token == token)
-                    .values(
-                        status="awaiting_evaluation",
-                        metrics=metrics,
-                        artifact_key=key,
-                        artifact_sha256=hashlib.sha256(data).hexdigest(),
-                        finished=time.time(),
-                    )
+    def pulse():
+        while not stopped.wait(20):
+            try:
+                with db.transaction() as s:
+                    if not s.execute(
+                        update(TrainingRun)
+                        .where(
+                            TrainingRun.id == run.id, TrainingRun.status == "running", TrainingRun.lease_token == token
+                        )
+                        .values(lease_until=time.time() + 180)
+                    ).rowcount:
+                        raise RuntimeError("Training lease lost")
+            except Exception as exc:
+                lease_errors.append(exc)
+                return
+
+    thread = Thread(target=pulse, daemon=True)
+    thread.start()
+    try:
+        root.mkdir(parents=True, exist_ok=False)
+        snapshot = json.dumps(run.snapshot, sort_keys=True)
+        if hashlib.sha256(snapshot.encode()).hexdigest() != run.config["snapshot_sha256"]:
+            raise ValueError("Training snapshot has changed")
+        (root / "snapshot.json").write_text(snapshot, encoding="utf-8")
+        dataset, output = root / "dataset", root / "output"
+        dataset.mkdir()
+        output.mkdir()
+        manifest = []
+        for item in run.snapshot:
+            if item["split"] != "train":
+                continue
+            data = storage.get(item["key"])
+            if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise ValueError("Dataset snapshot integrity check failed")
+            filename = item["id"] + ".png"
+            (dataset / filename).write_bytes(data)
+            manifest.append({"file_name": filename, "text": item["caption"]})
+        (dataset / "metadata.jsonl").write_text("\n".join(json.dumps(x) for x in manifest) + "\n")
+        cmd = training_command(run.config, checkout, dataset, output)
+        (root / "launch.json").write_text(
+            json.dumps({"command": cmd, "config": run.config}, indent=2), encoding="utf-8"
+        )
+        with (root / "train.log").open("wb") as log_file:
+            process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+            while process.poll() is None:
+                if lease_errors:
+                    raise lease_errors[0]
+                if time.monotonic() - began > timeout_hours * 3600:
+                    raise TimeoutError("Training exceeded the configured runtime budget")
+                metrics = {
+                    "elapsed_seconds": round(time.monotonic() - began, 1),
+                    "scalars": tensorboard_metrics(output),
+                    "train_images": len(manifest),
+                    "validation_images": len(run.snapshot) - len(manifest),
+                }
+                with db.transaction() as s:
+                    count = s.execute(
+                        update(TrainingRun)
+                        .where(
+                            TrainingRun.id == run.id,
+                            TrainingRun.status == "running",
+                            TrainingRun.lease_token == token,
+                        )
+                        .values(metrics=metrics, lease_until=time.time() + 180)
+                    ).rowcount
+                    if not count:
+                        raise RuntimeError("Training lease lost")
+                time.sleep(5)
+        log_key = f"training/{run.id}/train.log"
+        # Keep the end of the log, bounded to 2 MB.
+        with (root / "train.log").open("rb") as stream:
+            stream.seek(max(0, stream.seek(0, 2) - 2_000_000))
+            storage.put(log_key, stream.read())
+        if process.returncode:
+            raise RuntimeError("GPU training failed; see the private training log")
+        archive_outputs(db, storage, run.id, root, complete=True)
+        weights = output / "pytorch_lora_weights.safetensors"
+        from safetensors import safe_open
+
+        with safe_open(str(weights), framework="pt", device="cpu") as tensors:
+            if not list(tensors.keys()):
+                raise ValueError("Empty adapter artifact")
+        data = weights.read_bytes()
+        key = f"training/{run.id}/adapter.safetensors"
+        storage.put(key, data)
+        metrics = {
+            "elapsed_seconds": round(time.monotonic() - began, 1),
+            "scalars": tensorboard_metrics(output),
+            "train_images": len(manifest),
+            "validation_images": len(run.snapshot) - len(manifest),
+            "log_key": log_key,
+        }
+        with db.transaction() as s:
+            s.execute(
+                update(TrainingRun)
+                .where(TrainingRun.id == run.id, TrainingRun.status == "running", TrainingRun.lease_token == token)
+                .values(
+                    status="awaiting_evaluation",
+                    metrics=metrics,
+                    artifact_key=key,
+                    artifact_sha256=hashlib.sha256(data).hexdigest(),
+                    finished=time.time(),
                 )
+            )
     except BaseException:
         if process and process.poll() is None:
             import os
@@ -171,6 +207,10 @@ def train_one(db, storage, checkout, timeout_hours=12):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
         log.exception("Training run %s failed", run.id)
+        try:
+            archive_outputs(db, storage, run.id, root, complete=False)
+        except Exception:
+            log.exception("Archival failed; recover run %s from its persistent workspace", run.id)
         with db.transaction() as s:
             s.execute(
                 update(TrainingRun)
@@ -178,6 +218,9 @@ def train_one(db, storage, checkout, timeout_hours=12):
                 .values(status="failed", error="Training failed. Inspect the GPU worker logs.", finished=time.time())
             )
         raise
+    finally:
+        stopped.set()
+        thread.join(timeout=30)
     return True
 
 
@@ -191,9 +234,15 @@ def main():
         parser.error("Training budget must be greater than 0 and at most 48 hours")
     settings = PlatformSettings()
     db, storage = Database(settings.database_url), Storage(settings)
+    import signal
+
+    def stop(*_):
+        raise KeyboardInterrupt("Training worker stopping")
+
+    signal.signal(signal.SIGTERM, stop)
     while True:
         try:
-            worked = train_one(db, storage, args.diffusers_checkout, args.timeout_hours)
+            worked = train_one(db, storage, args.diffusers_checkout, args.timeout_hours, settings.training_work_dir)
         except Exception:
             worked = True
         if args.once:

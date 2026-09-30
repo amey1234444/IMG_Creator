@@ -13,3 +13,5 @@ exports
 third_party
 *.safetensors
 *.pth
+
+training-work

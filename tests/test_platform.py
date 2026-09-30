@@ -564,3 +564,183 @@ def test_provider_rejects_private_and_untrusted_polling_urls(monkeypatch):
         provider.safe_url("https://attacker.example/poll", polling=True)
     with pytest.raises(ValueError):
         provider.safe_url("http://api.bfl.ai/poll", polling=True)
+
+
+def test_schema_upgrade_is_additive_and_repeatable(platform):
+    from img_creator.platform.db import (
+        SchemaRevision,
+        AssetSource,
+        DatasetVersion,
+        DatasetVersionItem,
+        RunDataset,
+        TrainingArtifact,
+    )
+
+    _, uid = account(platform, "migration@example.com")
+    db = platform[1]
+    for table in [RunDataset, DatasetVersionItem, DatasetVersion, AssetSource, TrainingArtifact, SchemaRevision]:
+        table.__table__.drop(db.engine)
+    db.initialize()
+    db.initialize()
+    with db.transaction() as s:
+        assert s.get(User, uid).email == "migration@example.com"
+        assert s.get(SchemaRevision, 2)
+
+
+def test_versioned_datasets_preserve_captions_and_groups(platform):
+    from img_creator.platform.db import Dataset, Asset, AssetSource, DatasetVersion, DatasetVersionItem
+    from img_creator.platform.datasets import ingest, snapshot_run
+
+    db, storage = platform[1:3]
+    with db.transaction() as s:
+        d = Dataset(name="Versioned", rights_note="Owned source photographs")
+        s.add(d)
+        s.flush()
+        for i in range(10):
+            data = BytesIO()
+            Image.new("RGB", (256, 256), (i * 20, 12, 18)).save(data, format="PNG")
+            a = ingest(s, storage, d.id, f"{i}.png", data.getvalue())
+            a.caption = f"Vase {i}"
+            a.approved = True
+            s.flush()
+            s.get(AssetSource, a.id).group_id = f"shoot-{i // 2}"
+        cfg = {"steps": 100, "rank": 8, "seed": 42, "learning_rate": 0.0001}
+        r = snapshot_run(s, d.id, cfg)
+        s.flush()
+        snapshot = r.snapshot
+        version = r.config["dataset_version_id"]
+        assert all(
+            len({a["split"] for a in snapshot if a["group_id"] == group}) == 1
+            for group in {a["group_id"] for a in snapshot}
+        )
+        assert sum(a["split"] == "validation" for a in snapshot) == 2
+        second = snapshot_run(s, d.id, cfg)
+        assert second.config["dataset_version_id"] == version
+        s.get(Asset, snapshot[0]["id"]).caption = "Changed for a future experiment"
+        s.flush()
+        third = snapshot_run(s, d.id, cfg)
+        assert third.config["dataset_version_id"] != version
+        assert s.get(DatasetVersionItem, (version, snapshot[0]["id"])).caption == snapshot[0]["caption"]
+        assert len(list(s.scalars(select(DatasetVersion)))) == 2
+        source = s.get(AssetSource, snapshot[0]["id"])
+        assert hashlib.sha256(storage.get(source.original_key)).hexdigest() == source.original_sha256
+
+
+def test_api_limits_and_docs_default_off(platform):
+    app, db, storage, settings = platform
+    c, uid = account(platform, "rate@example.com")
+    limited = TestClient(create_app(replace(settings, api_requests_per_minute=10), db, storage))
+    limited.cookies.update(c.cookies)
+    assert limited.get("/docs").status_code == 404
+    assert limited.get("/openapi.json").status_code == 404
+    for _ in range(10):
+        assert limited.get("/api/me").status_code == 200
+    r = limited.get("/api/me")
+    assert r.status_code == 429 and int(r.headers["retry-after"]) > 0
+
+
+def test_archive_restore_and_corruption_detection(platform, tmp_path):
+    from img_creator.platform.db import Dataset, TrainingArtifact
+    from img_creator.platform.artifacts import archive_outputs, restore_run
+
+    db, storage = platform[1:3]
+    with db.transaction() as s:
+        ds = Dataset(name="Recover", rights_note="Owned reference images")
+        s.add(ds)
+        s.flush()
+        r = TrainingRun(dataset_id=ds.id, config={}, snapshot=[])
+        s.add(r)
+        s.flush()
+        rid = r.id
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "snapshot.json").write_text("[]")
+    for step in (100, 200):
+        p = root / "output" / f"checkpoint-{step}"
+        p.mkdir(parents=True)
+        (p / "model.safetensors").write_bytes(f"weights-{step}".encode())
+    assert archive_outputs(db, storage, rid, root, complete=False) == 2
+    assert archive_outputs(db, storage, rid, root, complete=False) == 0
+    with db.transaction() as s:
+        files = list(s.scalars(select(TrainingArtifact).where(TrainingArtifact.run_id == rid)))
+        assert not any("checkpoint-200" in a.path for a in files)
+    assert archive_outputs(db, storage, rid, root, complete=True) == 1
+    destination = tmp_path / "restored"
+    assert restore_run(db, storage, rid, destination) == 3
+    assert (destination / "RESTORE_VERIFIED").is_file()
+    with db.transaction() as s:
+        artifact = s.scalar(select(TrainingArtifact).where(TrainingArtifact.run_id == rid))
+    storage.put(artifact.key, b"corrupt")
+    with pytest.raises(ValueError, match="checksum"):
+        restore_run(db, storage, rid, tmp_path / "corrupt-restore")
+
+
+def test_training_options_reach_pinned_launcher(monkeypatch, tmp_path):
+    from img_creator.platform.app import TrainConfig
+    from img_creator.platform.training_worker import training_command
+    import training.train_lora
+
+    captured = {}
+
+    def fake_command(config, *args):
+        captured.update(config)
+        return ["python", "trainer.py", "--report_to", "none"]
+
+    monkeypatch.setattr(training.train_lora, "command", fake_command)
+    config = TrainConfig(dataset_id="a" * 32, resolution=768, lr_scheduler="linear", warmup_steps=20).model_dump()
+    result = training_command(config, tmp_path, tmp_path, tmp_path)
+    assert captured["resolution"] == 768
+    assert captured["use_aspect_ratio_buckets"] is True
+    assert captured["lr_scheduler"] == "linear"
+    assert captured["lr_warmup_steps"] == 20
+    assert captured["validation_prompt"] == config["validation_prompt"]
+    assert result[-1] == "tensorboard"
+    with pytest.raises(ValueError):
+        TrainConfig(dataset_id="a" * 32, steps=100, warmup_steps=100)
+
+
+def test_failed_training_keeps_workspace_and_archives_logs(platform, tmp_path, monkeypatch):
+    import json
+    import sys
+    from img_creator.platform import training_worker
+    from img_creator.platform.db import Dataset, TrainingArtifact
+
+    db, storage = platform[1:3]
+    with db.transaction() as s:
+        d = Dataset(name="Failure recovery", rights_note="Owned source data")
+        s.add(d)
+        s.flush()
+        r = TrainingRun(dataset_id=d.id, snapshot=[], config={"snapshot_sha256": hashlib.sha256(b"[]").hexdigest()})
+        s.add(r)
+        s.flush()
+        rid = r.id
+    monkeypatch.setattr(
+        training_worker,
+        "training_command",
+        lambda config, checkout, dataset, output: [
+            sys.executable,
+            "-c",
+            "print('diagnostic training failure'); raise SystemExit(1)",
+        ],
+    )
+    monkeypatch.setattr(training_worker, "tensorboard_metrics", lambda _: {})
+    with pytest.raises(RuntimeError, match="GPU training failed"):
+        training_worker.train_one(db, storage, tmp_path, work_dir=tmp_path / "work")
+    root = tmp_path / "work" / rid
+    assert root.exists() and "diagnostic training failure" in (root / "train.log").read_text()
+    assert json.loads((root / "snapshot.json").read_text()) == []
+    with db.transaction() as s:
+        assert s.get(TrainingRun, rid).status == "failed"
+        files = list(s.scalars(select(TrainingArtifact).where(TrainingArtifact.run_id == rid)))
+        assert {"train.log", "snapshot.json", "launch.json"}.issubset({f.path for f in files})
+
+
+def test_adapter_strength_is_explicit_and_model_specific():
+    req = Generation(
+        prompt="A ceramic vase", model="custom-klein-4b", training_run="a" * 32, effort="high", adapter_strength=0.75
+    )
+    assert req.adapter_strength == 0.75
+    with pytest.raises(ValueError):
+        Generation(prompt="A vase", adapter_strength=0.75)
+    with pytest.raises(ValueError):
+        Generation(prompt="A vase", model="custom-klein-4b", training_run="a" * 32, effort="high", adapter_strength=2)

@@ -76,6 +76,7 @@ class Generation(BaseModel):
     resolution: Literal["1K", "2K", "4K", "8K"] = "1K"
     upscale: Literal["resize", "learned"] = "resize"
     style: Literal["natural", "photographic", "cinematic", "product", "illustration"] = "photographic"
+    adapter_strength: float = Field(default=1.0, ge=0, le=1.5, allow_inf_nan=False)
     training_run: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     seed: int | None = Field(default=None, ge=0, le=2**32 - 1, strict=True)
 
@@ -88,6 +89,8 @@ class Generation(BaseModel):
             raise ValueError("This model does not expose that effort setting")
         if (self.model == "custom-klein-4b") != (self.training_run is not None):
             raise ValueError("Select an approved training run only for the custom model")
+        if self.model != "custom-klein-4b" and self.adapter_strength != 1.0:
+            raise ValueError("Adapter strength applies only to the custom model")
         return self
 
     def dimensions(self):

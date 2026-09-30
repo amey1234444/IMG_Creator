@@ -1,6 +1,7 @@
 # Hosted studio: architecture, deployment and owner operations
 
-Version 0.3 adds a separate multi-user application. The original local Gradio studio
+Version 0.4 extends the multi-user application. See [training lifecycle](training-lifecycle.md)
+for updated grouped splits, schema revision, checkpoint preservation and API limits. The original local Gradio studio
 and single-owner API still work. **Deploy `img_creator.platform.app:app` for the
 subscription product; never expose the old local API as the public product.**
 
@@ -140,7 +141,8 @@ same Postgres and bucket. The Blueprint blocks external database connections by
 default. Add only your GPU host's fixed egress IP if needed, use TLS, and configure
 its external database URL. Do not open the database to every IP.
 
-The initial schema command is not a migration system. For subsequent schema
+The schema command applies additive revision 2 (new tables only), as detailed in the
+training lifecycle guide. It is not a general migration system. For subsequent schema
 changes add versioned migrations, back up the database and test upgrades in staging.
 The server intentionally does not trust arbitrary forwarded headers; behind a
 proxy, anonymous limits can share the proxy's address. Configure trusted proxy
@@ -204,8 +206,8 @@ formats are rejected rather than guessed. “Any format” is not technically va
    become training examples, and their text is never executed as instructions.
 4. Queue a bounded Klein base 4B LoRA run with 5–2000 approved images, learning
    rate, steps and rank. The run freezes image hashes and captions. A deterministic
-   split holds out roughly 10%. Keep related subjects/shoots separate yourself;
-   the owner-upload split has no semantic near-duplicate detection. For bulk data,
+   grouped split holds out roughly 10% of groups. Set subject/shoot groups on image
+   cards; semantic near-duplicate detection is not automated. For bulk data,
    use the existing grouped-split CLI and a separate training integration.
 5. On the GPU host install `.[platform,inference,training]`, obtain the pinned
    Diffusers checkout documented in `training/README.md`, and run from this repo:

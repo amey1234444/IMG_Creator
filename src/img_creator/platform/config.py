@@ -26,9 +26,14 @@ class PlatformSettings:
     dev_license: bool = field(
         default_factory=lambda: os.getenv("FLUX_DEV_COMMERCIAL_LICENSE", "false").lower() == "true"
     )
+    expose_api_docs: bool = field(default_factory=lambda: os.getenv("EXPOSE_API_DOCS", "false").lower() == "true")
+    api_requests_per_minute: int = field(default_factory=lambda: int(os.getenv("API_REQUESTS_PER_MINUTE", "300")))
+    training_work_dir: Path = field(default_factory=lambda: Path(os.getenv("TRAINING_WORK_DIR", "training-work")))
     upload_limit: int = 25 * 1024 * 1024
 
     def __post_init__(self):
+        if not 10 <= self.api_requests_per_minute <= 10000:
+            raise ValueError("API_REQUESTS_PER_MINUTE must be between 10 and 10000")
         if self.database_url.startswith("postgres://"):
             object.__setattr__(
                 self, "database_url", self.database_url.replace("postgres://", "postgresql+psycopg://", 1)

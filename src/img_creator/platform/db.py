@@ -161,6 +161,61 @@ class Audit(Base):
     created = Column(Float, default=time.time)
 
 
+class SchemaRevision(Base):
+    __tablename__ = "schema_revisions"
+    version = Column(Integer, primary_key=True)
+    applied = Column(Float, default=time.time, nullable=False)
+
+
+class AssetSource(Base):
+    __tablename__ = "asset_sources"
+    asset_id = Column(ForeignKey("dataset_assets.id"), primary_key=True)
+    original_key = Column(String(250), nullable=False)
+    original_sha256 = Column(String(64), nullable=False)
+    original_bytes = Column(Integer, nullable=False)
+    group_id = Column(String(120), nullable=False, index=True)
+    quality = Column(JSON, nullable=False, default=dict)
+
+
+class DatasetVersion(Base):
+    __tablename__ = "dataset_versions"
+    __table_args__ = (UniqueConstraint("dataset_id", "sha256"),)
+    id = Column(String(32), primary_key=True, default=uid)
+    dataset_id = Column(ForeignKey("datasets.id"), nullable=False, index=True)
+    sha256 = Column(String(64), nullable=False)
+    settings = Column(JSON, nullable=False)
+    created = Column(Float, default=time.time, nullable=False)
+
+
+class DatasetVersionItem(Base):
+    __tablename__ = "dataset_version_items"
+    version_id = Column(ForeignKey("dataset_versions.id"), primary_key=True)
+    asset_id = Column(ForeignKey("dataset_assets.id"), primary_key=True)
+    caption = Column(Text, nullable=False)
+    group_id = Column(String(120), nullable=False)
+    split = Column(String(20), nullable=False)
+    key = Column(String(250), nullable=False)
+    sha256 = Column(String(64), nullable=False)
+
+
+class RunDataset(Base):
+    __tablename__ = "run_datasets"
+    run_id = Column(ForeignKey("training_runs.id"), primary_key=True)
+    version_id = Column(ForeignKey("dataset_versions.id"), nullable=False, index=True)
+
+
+class TrainingArtifact(Base):
+    __tablename__ = "training_artifacts"
+    __table_args__ = (UniqueConstraint("run_id", "path"),)
+    id = Column(String(32), primary_key=True, default=uid)
+    run_id = Column(ForeignKey("training_runs.id"), nullable=False, index=True)
+    path = Column(String(500), nullable=False)
+    key = Column(String(600), nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    created = Column(Float, default=time.time, nullable=False)
+
+
 class Database:
     def __init__(self, url):
         kwargs = {"connect_args": {"check_same_thread": False, "timeout": 30}} if url.startswith("sqlite") else {}
@@ -175,8 +230,18 @@ class Database:
         self.factory = sessionmaker(self.engine, expire_on_commit=False)
 
     def initialize(self):
-        # Initial schema only. Future schema revisions require an explicit migration.
-        Base.metadata.create_all(self.engine)
+        # Revision 2 is strictly additive: existing tables and data are not rewritten.
+        # Only the operator's pre-deploy command runs this; workers never migrate.
+        from sqlalchemy import select
+
+        with self.engine.begin() as connection:
+            if connection.dialect.name == "postgresql":
+                from sqlalchemy import text
+
+                connection.execute(text("SELECT pg_advisory_xact_lock(4782202)"))
+            Base.metadata.create_all(connection)
+            if connection.scalar(select(SchemaRevision.version).where(SchemaRevision.version == 2)) is None:
+                connection.execute(SchemaRevision.__table__.insert().values(version=2, applied=time.time()))
 
     @contextmanager
     def transaction(self):

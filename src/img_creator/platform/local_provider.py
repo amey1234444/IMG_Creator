@@ -123,7 +123,7 @@ class LocalProvider:
                 with tempfile.TemporaryDirectory() as directory:
                     (Path(directory) / "adapter.safetensors").write_bytes(data)
                     self.pipe.load_lora_weights(directory, weight_name="adapter.safetensors", adapter_name="studio")
-                    self.pipe.set_adapters(["studio"], adapter_weights=[1.0])
+                    self.pipe.set_adapters(["studio"], adapter_weights=[request.adapter_strength])
             native, _ = request.dimensions()
             steps = {"low": 20, "medium": 35, "high": 50}[request.effort]
             with torch.inference_mode():
@@ -143,6 +143,7 @@ class LocalProvider:
                 "provider": "self_hosted",
                 "model_id": model_id,
                 "adapter": adapter,
+                "adapter_strength": request.adapter_strength if adapter else None,
                 "steps": steps,
                 "tokens": None,
                 "provider_cost": None,

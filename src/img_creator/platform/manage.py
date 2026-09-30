@@ -10,13 +10,24 @@ from .security import email_address, password_hash
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["init-db", "create-owner", "reset-password"])
+    parser.add_argument("command", choices=["init-db", "create-owner", "reset-password", "restore-run"])
     parser.add_argument("--email")
+    parser.add_argument("--run-id")
+    parser.add_argument("--output")
     args = parser.parse_args()
     db = Database(PlatformSettings().database_url)
     if args.command == "init-db":
         db.initialize()
         print("Initial schema created")
+        return
+    if args.command == "restore-run":
+        from .artifacts import restore_run
+        from .storage import Storage
+
+        if not args.run_id or not args.output:
+            parser.error("restore-run requires --run-id and --output")
+        count = restore_run(db, Storage(PlatformSettings()), args.run_id, args.output)
+        print(f"Verified {count} files and rebuilt the training dataset")
         return
     if not args.email:
         parser.error("--email is required")

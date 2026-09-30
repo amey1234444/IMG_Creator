@@ -28,3 +28,4 @@ platform.db*
 
 .env.platform
 test-results/
+training-work/
