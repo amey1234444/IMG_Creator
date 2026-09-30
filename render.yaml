@@ -1,0 +1,37 @@
+# Paid resources are created only when you apply this Blueprint in Render.
+# Create the img-creator-secrets environment group first; see docs/platform.md.
+services:
+  - type: web
+    name: img-creator-web
+    runtime: docker
+    dockerfilePath: ./Dockerfile.platform
+    plan: starter
+    healthCheckPath: /health
+    preDeployCommand: python -m img_creator.platform.manage init-db
+    envVars:
+      - fromGroup: img-creator-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: img-creator-db
+          property: connectionString
+      - key: COOKIE_SECURE
+        value: 'true'
+  - type: worker
+    name: img-creator-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile.platform
+    plan: standard
+    dockerCommand: python -m img_creator.platform.worker --backend bfl
+    envVars:
+      - fromGroup: img-creator-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: img-creator-db
+          property: connectionString
+
+databases:
+  - name: img-creator-db
+    plan: basic-256mb
+    databaseName: img_creator
+    user: img_creator
+    ipAllowList: []

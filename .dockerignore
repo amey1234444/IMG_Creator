@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+.env.*
+__pycache__
+*.db*
+platform-data
+outputs
+models
+data
+prepared
+exports
+third_party
+*.safetensors
+*.pth

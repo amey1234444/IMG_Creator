@@ -22,3 +22,9 @@ third_party/
 build/
 dist/
 benchmark-*.jsonl
+
+platform-data/
+platform.db*
+
+.env.platform
+test-results/

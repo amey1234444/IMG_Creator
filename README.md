@@ -1,8 +1,21 @@
 # IMG Creator
 
+## Hosted subscription platform — version 0.3
+
+The new public studio adds user accounts, private galleries, model/effort/resolution
+selection, credit quotes, Stripe subscription hooks, a durable job queue, an owner
+console, dataset review and a separate GPU LoRA worker. Start with the
+[hosted platform and Render deployment guide](docs/platform.md). The
+[Render Blueprint](render.yaml) and [platform environment example](.env.platform.example)
+are included. Provider keys, a private bucket, Stripe setup and GPU validation are
+still required; this change does not deploy or purchase services.
+
+**The sections below describe the original local studio**, which remains a separate
+entry point. Do not expose its single-owner API as the hosted multi-user app.
+
 A local image studio built around FLUX.2 Klein. Generate photographs, illustrations, products, architecture and other visual styles; use a reference image; apply your own LoRA; export reproducible image/metadata pairs.
 
-**Version 0.2 — implementation foundation, awaiting real-model hardware validation.** No hosted image API or paid SaaS is required. Model downloads need internet initially. Hardware, electricity and rented GPUs still have costs.
+**Local studio — awaiting real-model hardware validation.** No hosted image API or paid SaaS is required. Model downloads need internet initially. Hardware, electricity and rented GPUs still have costs.
 
 ## What is implemented, tested, and planned
 
