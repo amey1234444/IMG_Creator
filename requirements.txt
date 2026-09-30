@@ -1,0 +1,2 @@
+# Full local UI + inference installation. For tests only: pip install -e '.[dev]'
+-e .[inference,ui]

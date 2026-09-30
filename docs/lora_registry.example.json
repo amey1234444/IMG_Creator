@@ -1,0 +1,6 @@
+{
+  "industrial-v1": {
+    "path": "../checkpoints/industrial-v1/pytorch_lora_weights.safetensors",
+    "model": "black-forest-labs/FLUX.2-klein-base-4B"
+  }
+}
