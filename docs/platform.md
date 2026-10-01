@@ -70,7 +70,9 @@ and multiples of 16. The quote shows exact native and export dimensions before
 submission. Larger exports use a disclosed Lanczos resize or configured learned
 upscaler. Resizing does not add learned detail; learned SR can distort fine detail.
 Missing learned weights produces an explicit error. Configure identical upscaler
-settings on web and workers before enabling it.
+settings on web and workers before enabling it. The [v2 high-resolution pipeline](high-resolution-pipeline.md)
+uses progressive learned passes, retains a private native source, and records
+pass/tile progress. Its final adjustment never interpolates an enlargement.
 
 Generation records include actual seed, effective prompt, model, effort, native
 size, export size, provider request, processing method and worker duration. Hosted

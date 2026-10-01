@@ -145,6 +145,10 @@ def test_worker_success_and_private_download(platform):
     assert data.status_code == 200
     assert Image.open(BytesIO(data.content)).size == (1024, 1024)
     assert other.get(out["result"]["image_url"]).status_code == 404
+    native = c.get(out["result"]["native_artifact"]["image_url"])
+    assert Image.open(BytesIO(native.content)).size == (512, 512)
+    assert out["result"]["sha256"] == hashlib.sha256(data.content).hexdigest()
+    assert out["progress"] == {"stage": "complete"}
 
 
 @pytest.mark.parametrize(
@@ -744,3 +748,57 @@ def test_adapter_strength_is_explicit_and_model_specific():
         Generation(prompt="A vase", adapter_strength=0.75)
     with pytest.raises(ValueError):
         Generation(prompt="A vase", model="custom-klein-4b", training_run="a" * 32, effort="high", adapter_strength=2)
+
+
+def test_sr_preflight_refunds_without_provider_call(platform, monkeypatch):
+    from img_creator.upscale import Upscaler
+
+    _, user_id = account(platform, "sr-config@example.com")
+    job = submit(platform[1], user_id, Generation(prompt="vase", upscale="learned"), "sr-config-key")
+
+    def unavailable(*args):
+        raise ValueError("invalid checkpoint")
+
+    monkeypatch.setattr(Upscaler, "prepare", unavailable)
+    run_one(platform[1], platform[2], object())  # no generate method: must never be called
+    with platform[1].transaction() as session:
+        assert session.get(Job, job.id).status == "failed"
+        assert session.get(User, user_id).credits == 100
+
+
+def test_sr_failure_preserves_native_and_provider_state(platform, monkeypatch):
+    from img_creator.upscale import Upscaler
+
+    client, user_id = account(platform, "sr-fail@example.com")
+    other, _ = account(platform, "sr-other@example.com")
+    job = submit(platform[1], user_id, Generation(prompt="vase", upscale="learned"), "sr-failure-key")
+    calls = []
+
+    class Provider:
+        def generate(self, request, heartbeat):
+            calls.append(request)
+            heartbeat({"id": "paid-id", "polling_url": "https://private-provider.example"})
+            return Image.new("RGB", (128, 128), "blue"), {"native_size": [128, 128]}
+
+    def fail(*args, **kwargs):
+        kwargs["progress"]({"stage": "super_resolution", "pass": 1, "passes": 2, "tiles_done": 1, "tiles_total": 1})
+        raise RuntimeError("GPU failure")
+
+    monkeypatch.setattr(Upscaler, "prepare", lambda *args: None)
+    monkeypatch.setattr(Upscaler, "run", fail)
+    run_one(platform[1], platform[2], Provider())
+    result = client.get("/api/jobs/" + job.id).json()
+    assert result["status"] == "uncertain"
+    assert len(calls) == 1
+    assert result["progress"]["stage"] == "super_resolution"
+    assert "polling_url" not in str(result)
+    native_url = f"/api/jobs/{job.id}/native"
+    original = client.get(native_url)
+    assert original.status_code == 200
+    assert Image.open(BytesIO(original.content)).size == (128, 128)
+    assert other.get(native_url).status_code == 404
+    with platform[1].transaction() as session:
+        saved = session.get(Job, job.id)
+        assert saved.provider_state["id"] == "paid-id"
+        assert saved.provider_state["native_artifact"]["sha256"] == hashlib.sha256(original.content).hexdigest()
+        assert session.get(User, user_id).credits == 100 - job.credits

@@ -61,3 +61,20 @@ and verified restoration, failed-training log/workspace preservation, training
 parameter forwarding and model-specific adapter influence. Lint, formatting,
 compile and JavaScript syntax checks passed. GPU quality/training and actual
 cloud storage recovery remain hardware/infrastructure acceptance tasks.
+
+
+## High-resolution pipeline 0.5 — 1 October 2026
+
+Local Python 3.12 suite: **127 tests passed**, including optional CPU tensor tests
+with Torch 2.14.1+cpu, matching Torchvision 0.29.1+cpu and Spandrel 0.4.2.
+Coverage includes all aspect/resolution/2x/4x plans, real 8192-square allocation
+with a fake predictor, spatial-filter tile equivalence, bounded OOM retries,
+preflight refunds, private native-source preservation after enhancement failure,
+artifact hashes and provider-state retention. A small randomly initialized
+ESRGAN checkpoint was loaded and evaluated through Spandrel across two passes;
+this validates the tensor integration, not pretrained-model quality.
+
+A separate CPU SR CI job installs matching Torch/Torchvision wheels and exercises
+the tensor tests; lightweight jobs skip that optional module. Production
+pretrained SR/FLUX inference, CUDA peak memory and image-quality evaluation have
+not been run. See [the architecture and acceptance guide](high-resolution-pipeline.md).

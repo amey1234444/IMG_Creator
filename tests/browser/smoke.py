@@ -22,6 +22,7 @@ env = {
     "S3_BUCKET": "",
     "STRIPE_SECRET_KEY": "",
     "LOCAL_MODELS_ENABLED": "false",
+    "IMG_CREATOR_SR_WEIGHTS": "",
 }
 db = Database(env["DATABASE_URL"])
 db.initialize()
@@ -69,6 +70,8 @@ try:
         assert response is not None
         policy = response.headers.get("content-security-policy", "")
         assert "script-src 'self'" in policy and "'unsafe-eval'" not in policy
+        expect(page.locator('#upscale option[value="learned"]')).to_be_disabled()
+        expect(page.locator("#download-native")).to_be_hidden()
         page.screenshot(path="test-results/studio-desktop.png", full_page=True)
         page.locator("#auth-open").click()
         page.locator("#email").fill("preview@example.com")

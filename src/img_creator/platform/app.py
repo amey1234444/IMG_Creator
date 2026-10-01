@@ -142,7 +142,7 @@ def create_app(settings=None, db=None, storage=None):
     storage = storage or Storage(settings)
     app = FastAPI(
         title="IMG Creator Studio",
-        version="0.4.0",
+        version="0.5.0",
         docs_url="/docs" if settings.expose_api_docs else None,
         redoc_url=None,
         openapi_url="/openapi.json" if settings.expose_api_docs else None,
@@ -245,8 +245,12 @@ def create_app(settings=None, db=None, storage=None):
 
     @app.get("/api/catalog")
     def catalog():
+        from ..config import Settings
+
         return {
             "models": [{"id": k, **v, "available": model_enabled(k)} for k, v in MODELS.items()],
+            "upscalers": {"resize": True, "learned": bool(Settings().sr_weights)},
+            "high_resolution_pipeline": "progressive-tiled-sr-v2",
             "ratios": list(RATIOS),
             "resolutions": ["1K", "2K", "4K", "8K"],
             "plans": [
@@ -345,6 +349,17 @@ def create_app(settings=None, db=None, storage=None):
     def job(job_id: str, user=Depends(current)):
         with db.transaction() as s:
             return serialize(owned_job(s, job_id, user))
+
+    @app.get("/api/jobs/{job_id}/native")
+    def native_image(job_id: str, user=Depends(current)):
+        rate_limit(db, "image-download", user.id, 60, 60)
+        with db.transaction() as s:
+            item = owned_job(s, job_id, user)
+            artifact = (item.provider_state or {}).get("native_artifact")
+            if not artifact:
+                raise HTTPException(404, "Native image is not ready")
+            key = artifact["key"]
+        return Response(storage.get(key), media_type="image/png")
 
     @app.get("/api/jobs/{job_id}/image")
     def image(job_id: str, user=Depends(current)):

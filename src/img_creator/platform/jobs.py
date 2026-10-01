@@ -118,6 +118,8 @@ def serialize(job):
     return {
         "id": job.id,
         "status": job.status,
+        "progress": (job.provider_state or {}).get("progress"),
+        "native_image_url": f"/api/jobs/{job.id}/native" if (job.provider_state or {}).get("native_artifact") else None,
         "credits": job.credits,
         "request": job.request,
         "result": job.result,

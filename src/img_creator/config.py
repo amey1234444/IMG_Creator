@@ -25,11 +25,14 @@ class Settings:
         )
     )
     tile_size: int = field(default_factory=lambda: int(os.getenv("IMG_CREATOR_TILE_SIZE", "256")))
+    tile_pad: int = field(default_factory=lambda: int(os.getenv("IMG_CREATOR_TILE_PAD", "64")))
     api_key: str | None = field(default_factory=lambda: os.getenv("IMG_CREATOR_API_KEY") or None)
 
     def __post_init__(self):
         if self.device not in {"auto", "cuda", "mps", "cpu"}:
             raise ValueError("IMG_CREATOR_DEVICE must be auto, cuda, mps, or cpu")
+        if not 16 <= self.tile_pad <= 128:
+            raise ValueError("IMG_CREATOR_TILE_PAD must be between 16 and 128")
         if not 64 <= self.tile_size <= 1024:
             raise ValueError("IMG_CREATOR_TILE_SIZE must be between 64 and 1024")
 

@@ -1,8 +1,11 @@
 # IMG Creator
 
-## Hosted subscription platform — version 0.4
+## Hosted subscription platform — version 0.5
 
-See the new [training-first workflow, schema and recovery guide](docs/training-lifecycle.md)
+See the [8K generation architecture and worker setup](docs/high-resolution-pipeline.md)
+for progressive learned super-resolution, native source preservation and stage records.
+
+See the [training-first workflow, schema and recovery guide](docs/training-lifecycle.md)
 for versioned datasets, grouped splits, training controls and preserved artifacts.
 
 The public studio adds user accounts, private galleries, model/effort/resolution
@@ -109,7 +112,7 @@ IMG_CREATOR_SR_WEIGHTS=/absolute/path/to/model.pth
 IMG_CREATOR_TILE_SIZE=256
 ```
 
-Select **learned** or the **Ultra** profile. Missing weights cause an explicit error; the app never silently substitutes Lanczos. Spandrel detects the weight architecture, tiles have 32 pixels of context, and the output canvas stays in host RAM. The learned intermediate is limited to 64 megapixels. Exact-size export then crops/resamples as needed. An 8K export beyond the model's SR scale includes a final resize, recorded in metadata.
+Select **learned** or the **Ultra** profile. Missing weights cause an explicit error; the app never silently substitutes Lanczos. Spandrel detects the weight architecture. Tiles use configurable context (64 pixels by default); the canvas stays in host RAM. Learned passes continue until both export dimensions are covered, with each canvas bounded at 70 megapixels. Final adjustment only crops/downsamples; it never interpolates a remaining enlargement. See the [pipeline guide](docs/high-resolution-pipeline.md) for resource requirements and quality limitations.
 
 See [high-resolution details](docs/high_resolution.md). Arbitrary checkpoint types and every Spandrel architecture are not guaranteed compatible; test the chosen weights before relying on them.
 
