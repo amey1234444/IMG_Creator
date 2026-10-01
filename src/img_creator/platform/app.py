@@ -19,6 +19,7 @@ from .storage import Storage
 from .jobs import submit, serialize
 from .datasets import ingest, snapshot_run
 from . import billing
+from .db import VersionAnalysis
 from .db import AssetSource, DatasetVersion, DatasetVersionItem, TrainingArtifact
 from .metrics import usage_rows, empty_usage
 from .middleware import BodyLimitMiddleware, BodyTooLarge
@@ -142,7 +143,7 @@ def create_app(settings=None, db=None, storage=None):
     storage = storage or Storage(settings)
     app = FastAPI(
         title="IMG Creator Studio",
-        version="0.5.0",
+        version="0.6.0",
         docs_url="/docs" if settings.expose_api_docs else None,
         redoc_url=None,
         openapi_url="/openapi.json" if settings.expose_api_docs else None,
@@ -237,6 +238,10 @@ def create_app(settings=None, db=None, storage=None):
             if not Settings().sr_weights:
                 raise HTTPException(422, "Learned upscaling is not configured on the worker")
 
+    from .analysis_jobs import install_analysis_routes
+
+    install_analysis_routes(app, owner, db, storage, settings)
+
     @app.get("/health")
     def health():
         with db.transaction() as s:
@@ -250,6 +255,7 @@ def create_app(settings=None, db=None, storage=None):
         return {
             "models": [{"id": k, **v, "available": model_enabled(k)} for k, v in MODELS.items()],
             "upscalers": {"resize": True, "learned": bool(Settings().sr_weights)},
+            "image_analysis_available": settings.vision_enabled,
             "high_resolution_pipeline": "progressive-tiled-sr-v2",
             "ratios": list(RATIOS),
             "resolutions": ["1K", "2K", "4K", "8K"],
@@ -686,9 +692,14 @@ def create_app(settings=None, db=None, storage=None):
         with db.transaction() as s:
             if not s.get(DatasetVersion, version_id):
                 raise HTTPException(404, "Dataset version not found")
+            reviews = {
+                a.asset_id: a.review_id
+                for a in s.scalars(select(VersionAnalysis).where(VersionAnalysis.version_id == version_id))
+            }
             return [
                 {
                     "asset_id": i.asset_id,
+                    "analysis_review_id": reviews.get(i.asset_id),
                     "caption": i.caption,
                     "group_id": i.group_id,
                     "split": i.split,

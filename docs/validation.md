@@ -78,3 +78,17 @@ A separate CPU SR CI job installs matching Torch/Torchvision wheels and exercise
 the tensor tests; lightweight jobs skip that optional module. Production
 pretrained SR/FLUX inference, CUDA peak memory and image-quality evaluation have
 not been run. See [the architecture and acceptance guide](high-resolution-pipeline.md).
+
+
+## Image understanding 0.6
+
+Local suite: **134 tests passed**, including multi-view coverage, strict report
+validation, inference-call settings, owner-only queue and crop access, duplicate
+submission reuse, checksum rejection, failed-attempt retention, lease loss,
+manual correction and immutable training-review lineage. Ruff, JavaScript syntax
+and diff checks passed. The real Qwen processor/tokenizer smoke test passed on
+Transformers 5.18.0 with five views, input shape `[1, 2833]` and five image grids.
+This check caught an incompatible old processor revision; the model is now pinned
+at `cc594898137f460bfe9f0759e9844b3ce807cfb5`. No Qwen weights or real extraction
+accuracy evaluation were run. Browser CI exercises image upload, queued analysis,
+review and caption approval using an explicit prediction fixture.

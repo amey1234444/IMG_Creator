@@ -159,3 +159,6 @@ and trusted proxies at deployment time.
 These changes provide experimental and recovery infrastructure. Actual GPU
 training, overfit checks, checkpoint resume and learned-SR visual acceptance must
 still be run with your data. No newly trained weights or quality scores are bundled.
+
+
+For structured visual descriptions and reviewed captions, use the [image-understanding worker](image-understanding.md) before freezing a training dataset.

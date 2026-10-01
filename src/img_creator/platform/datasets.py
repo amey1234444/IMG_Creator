@@ -7,7 +7,8 @@ import json
 import zipfile
 from PIL import Image, ImageOps, ImageFilter, ImageStat
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
+from .db import AnalysisReview, ImageAnalysis, VersionAnalysis
 from .db import Asset, AssetSource, DatasetVersion, DatasetVersionItem, RunDataset, TrainingRun, uid
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -121,6 +122,25 @@ def snapshot_run(s, dataset_id, config):
     fraction = config.get("validation_fraction", 0.1)
     ordered = sorted(unique_groups, key=lambda g: hashlib.sha256(f"{split_seed}:{g}".encode()).hexdigest())
     held_out = set(ordered[: max(1, min(len(ordered) - 1, round(len(ordered) * fraction)))])
+    ranked = (
+        select(
+            AnalysisReview.id,
+            func.row_number()
+            .over(partition_by=AnalysisReview.asset_id, order_by=AnalysisReview.created.desc())
+            .label("position"),
+        )
+        .where(AnalysisReview.asset_id.in_([a.id for a in assets]))
+        .subquery()
+    )
+    reviewed = {
+        r.asset_id: (r, sha)
+        for r, sha in s.execute(
+            select(AnalysisReview, ImageAnalysis.source_sha256)
+            .join(ranked, ranked.c.id == AnalysisReview.id)
+            .join(ImageAnalysis, ImageAnalysis.id == AnalysisReview.analysis_id)
+            .where(ranked.c.position == 1)
+        )
+    }
     snapshot = [
         {
             "id": a.id,
@@ -132,6 +152,10 @@ def snapshot_run(s, dataset_id, config):
         }
         for a in assets
     ]
+    for item in snapshot:
+        review = reviewed.get(item["id"])
+        if review and review[0].caption == item["caption"] and review[1] == item["sha256"]:
+            item["analysis_review_id"] = review[0].id
     if any(not a["caption"].strip() for a in snapshot):
         raise HTTPException(422, "Every training image requires a caption")
     if sum(a["split"] == "train" for a in snapshot) < 2:
@@ -148,6 +172,8 @@ def snapshot_run(s, dataset_id, config):
         s.add(version)
         s.flush()
         for item in snapshot:
+            if item.get("analysis_review_id"):
+                s.add(VersionAnalysis(version_id=version.id, asset_id=item["id"], review_id=item["analysis_review_id"]))
             s.add(
                 DatasetVersionItem(
                     version_id=version.id,

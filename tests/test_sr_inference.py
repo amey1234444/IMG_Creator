@@ -59,3 +59,65 @@ def test_rgb_tensor_conversion_preserves_values():
     output = Upscaler(Settings(device="cpu"))._infer_tile(image, NearestModel())
     assert output.size == (14, 18)
     assert output.getpixel((13, 17)) == (23, 101, 249)
+
+
+def test_local_vision_generation_contract(monkeypatch):
+    import sys
+    from img_creator.platform.vision import LocalVision, MODEL_REVISION
+    from img_creator.platform.config import PlatformSettings
+
+    observed = {}
+
+    class Inputs(dict):
+        def __getattr__(self, name):
+            return self[name]
+
+        def to(self, device):
+            assert device == "cpu"
+            return self
+
+    class Processor:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            observed["processor_config"] = kwargs
+            return cls()
+
+        def apply_chat_template(self, messages, **kwargs):
+            observed["messages"] = messages
+            return "test prompt"
+
+        def __call__(self, **kwargs):
+            observed["images"] = len(kwargs["images"])
+            return Inputs(input_ids=torch.ones((1, 5), dtype=torch.long), image_grid_thw=torch.tensor([[1, 2, 2]]))
+
+        def batch_decode(self, ids, **kwargs):
+            assert ids.shape == (1, 3)
+            return ['{"test":true}']
+
+    class Model:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            observed["model_config"] = kwargs
+            return cls()
+
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+        def generate(self, **kwargs):
+            observed["generation"] = kwargs
+            return torch.ones((1, 8), dtype=torch.long)
+
+    monkeypatch.setitem(
+        sys.modules, "transformers", SimpleNamespace(AutoProcessor=Processor, Qwen2_5_VLForConditionalGeneration=Model)
+    )
+    raw, metrics = LocalVision(PlatformSettings(vision_device="cpu")).analyze(Image.new("RGB", (800, 800)), "deep")
+    assert raw == '{"test":true}' and metrics["output_tokens"] == 3
+    assert observed["images"] == 10
+    assert observed["model_config"]["revision"] == MODEL_REVISION
+    assert observed["model_config"]["trust_remote_code"] is False
+    assert observed["generation"]["do_sample"] is False
+    assert observed["generation"]["max_new_tokens"] == 4096
+    assert observed["generation"]["max_time"] == 600

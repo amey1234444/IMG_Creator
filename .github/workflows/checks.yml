@@ -71,3 +71,14 @@ jobs:
       - run: python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -e '.[dev,upscale]'
       - run: python -m pytest tests/test_sr_inference.py tests/test_upscale.py -q
+
+  vision-processor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'torch>=2.6,<3' 'torchvision>=0.21,<1' --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install -e '.[vision]'
+      - run: python tests/vision_processor_smoke.py

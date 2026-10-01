@@ -216,6 +216,53 @@ class TrainingArtifact(Base):
     created = Column(Float, default=time.time, nullable=False)
 
 
+class ImageAnalysis(Base):
+    __tablename__ = "image_analyses"
+    id = Column(String(32), primary_key=True, default=uid)
+    fingerprint = Column(String(64), unique=True, nullable=False)
+    asset_id = Column(ForeignKey("dataset_assets.id"), nullable=False, index=True)
+    source_sha256 = Column(String(64), nullable=False)
+    config = Column(JSON, nullable=False)
+    status = Column(String(30), default="queued", nullable=False, index=True)
+    report = Column(JSON)
+    raw_output = Column(Text)
+    metrics = Column(JSON, default=dict)
+    error = Column(Text)
+    lease_token = Column(String(32))
+    lease_until = Column(Float, default=0)
+    created = Column(Float, default=time.time, nullable=False)
+    finished = Column(Float)
+
+
+class AnalysisAttempt(Base):
+    __tablename__ = "image_analysis_attempts"
+    id = Column(String(32), primary_key=True, default=uid)
+    analysis_id = Column(ForeignKey("image_analyses.id"), nullable=False, index=True)
+    status = Column(String(30), nullable=False)
+    raw_output = Column(Text)
+    metrics = Column(JSON, nullable=False)
+    error = Column(Text)
+    created = Column(Float, default=time.time, nullable=False)
+
+
+class AnalysisReview(Base):
+    __tablename__ = "image_analysis_reviews"
+    id = Column(String(32), primary_key=True, default=uid)
+    analysis_id = Column(ForeignKey("image_analyses.id"), nullable=False, index=True)
+    asset_id = Column(ForeignKey("dataset_assets.id"), nullable=False, index=True)
+    reviewer = Column(ForeignKey("users.id"), nullable=False)
+    report = Column(JSON, nullable=False)
+    caption = Column(Text, nullable=False)
+    created = Column(Float, default=time.time, nullable=False)
+
+
+class VersionAnalysis(Base):
+    __tablename__ = "dataset_version_analyses"
+    version_id = Column(ForeignKey("dataset_versions.id"), primary_key=True)
+    asset_id = Column(ForeignKey("dataset_assets.id"), primary_key=True)
+    review_id = Column(ForeignKey("image_analysis_reviews.id"), nullable=False)
+
+
 class Database:
     def __init__(self, url):
         kwargs = {"connect_args": {"check_same_thread": False, "timeout": 30}} if url.startswith("sqlite") else {}
@@ -230,7 +277,7 @@ class Database:
         self.factory = sessionmaker(self.engine, expire_on_commit=False)
 
     def initialize(self):
-        # Revision 2 is strictly additive: existing tables and data are not rewritten.
+        # Revisions 2 and 3 are strictly additive: existing tables and data are not rewritten.
         # Only the operator's pre-deploy command runs this; workers never migrate.
         from sqlalchemy import select
 
@@ -240,8 +287,9 @@ class Database:
 
                 connection.execute(text("SELECT pg_advisory_xact_lock(4782202)"))
             Base.metadata.create_all(connection)
-            if connection.scalar(select(SchemaRevision.version).where(SchemaRevision.version == 2)) is None:
-                connection.execute(SchemaRevision.__table__.insert().values(version=2, applied=time.time()))
+            for version in (2, 3):
+                if connection.scalar(select(SchemaRevision.version).where(SchemaRevision.version == version)) is None:
+                    connection.execute(SchemaRevision.__table__.insert().values(version=version, applied=time.time()))
 
     @contextmanager
     def transaction(self):

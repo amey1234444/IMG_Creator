@@ -1,6 +1,9 @@
 """Browser smoke test against an isolated local app; never calls paid providers."""
 
 import os
+from io import BytesIO
+from PIL import Image
+from sqlalchemy import select
 import re
 from pathlib import Path
 import subprocess
@@ -8,7 +11,7 @@ import sys
 import tempfile
 import time
 import httpx
-from img_creator.platform.db import Database, User
+from img_creator.platform.db import Database, User, ImageAnalysis
 from img_creator.platform.security import password_hash
 
 root = tempfile.TemporaryDirectory(prefix="img-ui-")
@@ -23,6 +26,7 @@ env = {
     "STRIPE_SECRET_KEY": "",
     "LOCAL_MODELS_ENABLED": "false",
     "IMG_CREATOR_SR_WEIGHTS": "",
+    "VISION_ANALYSIS_ENABLED": "true",
 }
 db = Database(env["DATABASE_URL"])
 db.initialize()
@@ -95,6 +99,41 @@ try:
         page.locator("#upload-form button").click()
         page.locator("#assets-grid article").wait_for()
         assert "notes.txt" in page.locator("#assets-grid").inner_text()
+        image_bytes = BytesIO()
+        Image.new("RGB", (800, 800), "blue").save(image_bytes, format="PNG")
+        page.locator("#asset-files").set_input_files(
+            {"name": "reference.png", "mimeType": "image/png", "buffer": image_bytes.getvalue()}
+        )
+        page.locator("#upload-form button").click()
+        expect(page.locator("#assets-grid article")).to_have_count(2)
+        page.get_by_role("button", name="Analyze image details", exact=True).click()
+        expect(page.locator("#assets-grid")).to_contain_text("Analysis: queued")
+        # Model prediction fixture only: exercise the actual review UI and API,
+        # never download weights or call a paid provider in browser CI.
+        with db.transaction() as session:
+            analysis = session.scalar(select(ImageAnalysis))
+            analysis.status = "succeeded"
+            analysis.report = {
+                "scene": "A blue reference image",
+                "objects": [],
+                "relationships": [],
+                "composition": "Solid blue frame",
+                "lighting": "Even appearance",
+                "colors": ["blue"],
+                "materials": [],
+                "visible_text": [],
+                "uncertainties": [],
+                "suggested_caption": "A solid blue reference image with even appearance.",
+            }
+        page.get_by_role("button", name="Refresh analysis", exact=True).click()
+        page.get_by_role("button", name="Use suggested training caption", exact=True).click()
+        expect(page.get_by_role("textbox", name="Caption for reference.png", exact=True)).to_have_value(
+            "A solid blue reference image with even appearance."
+        )
+        page.locator("summary").filter(has_text="Inspect and correct structured observations").click()
+        page.screenshot(path="test-results/image-analysis-review.png", full_page=True)
+        page.get_by_role("button", name="Approve corrected analysis and caption", exact=True).click()
+        expect(page.locator("#assets-grid article").filter(has_text="reference.png")).to_contain_text("Reviewed")
         page.locator('[data-page="billing"]').click()
         page.locator("#plans .plan").first.wait_for()
         page.locator('[data-page="studio"]').click()

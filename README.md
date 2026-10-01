@@ -1,6 +1,9 @@
 # IMG Creator
 
-## Hosted subscription platform — version 0.5
+## Hosted subscription platform — version 0.6
+
+See the [detailed image-understanding and caption review guide](docs/image-understanding.md)
+for local multi-view analysis, object crops and reviewed training lineage.
 
 See the [8K generation architecture and worker setup](docs/high-resolution-pipeline.md)
 for progressive learned super-resolution, native source preservation and stage records.

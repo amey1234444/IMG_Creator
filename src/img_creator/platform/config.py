@@ -29,9 +29,15 @@ class PlatformSettings:
     expose_api_docs: bool = field(default_factory=lambda: os.getenv("EXPOSE_API_DOCS", "false").lower() == "true")
     api_requests_per_minute: int = field(default_factory=lambda: int(os.getenv("API_REQUESTS_PER_MINUTE", "300")))
     training_work_dir: Path = field(default_factory=lambda: Path(os.getenv("TRAINING_WORK_DIR", "training-work")))
+    vision_enabled: bool = field(
+        default_factory=lambda: os.getenv("VISION_ANALYSIS_ENABLED", "false").lower() == "true"
+    )
+    vision_device: str = field(default_factory=lambda: os.getenv("VISION_DEVICE", "cuda"))
     upload_limit: int = 25 * 1024 * 1024
 
     def __post_init__(self):
+        if self.vision_device not in {"auto", "cpu", "cuda", "mps"}:
+            raise ValueError("Invalid VISION_DEVICE")
         if not 10 <= self.api_requests_per_minute <= 10000:
             raise ValueError("API_REQUESTS_PER_MINUTE must be between 10 and 10000")
         if self.database_url.startswith("postgres://"):

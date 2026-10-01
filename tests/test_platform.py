@@ -582,7 +582,20 @@ def test_schema_upgrade_is_additive_and_repeatable(platform):
 
     _, uid = account(platform, "migration@example.com")
     db = platform[1]
-    for table in [RunDataset, DatasetVersionItem, DatasetVersion, AssetSource, TrainingArtifact, SchemaRevision]:
+    from img_creator.platform.db import VersionAnalysis, AnalysisReview, AnalysisAttempt, ImageAnalysis
+
+    for table in [
+        VersionAnalysis,
+        AnalysisReview,
+        AnalysisAttempt,
+        ImageAnalysis,
+        RunDataset,
+        DatasetVersionItem,
+        DatasetVersion,
+        AssetSource,
+        TrainingArtifact,
+        SchemaRevision,
+    ]:
         table.__table__.drop(db.engine)
     db.initialize()
     db.initialize()
@@ -802,3 +815,150 @@ def test_sr_failure_preserves_native_and_provider_state(platform, monkeypatch):
         assert saved.provider_state["id"] == "paid-id"
         assert saved.provider_state["native_artifact"]["sha256"] == hashlib.sha256(original.content).hexdigest()
         assert session.get(User, user_id).credits == 100 - job.credits
+
+
+def vision_fixture(platform):
+    from img_creator.platform.datasets import ingest
+    from img_creator.platform.db import Dataset
+    from test_vision import report_example
+
+    app, db, storage, settings = platform
+    app = create_app(replace(settings, vision_enabled=True, vision_device="cpu"), db, storage)
+    enabled = (app, db, storage, settings)
+    owner, _ = account(enabled, "vision-owner@example.com", "owner")
+    member, _ = account(enabled, "vision-member@example.com")
+    with db.transaction() as s:
+        ds = Dataset(name="Vision training", rights_note="Owned sample images")
+        s.add(ds)
+        s.flush()
+        assets = []
+        for i in range(5):
+            data = BytesIO()
+            Image.new("RGB", (800, 800), (i * 30, 20, 180)).save(data, format="PNG")
+            asset = ingest(s, storage, ds.id, f"sample-{i}.png", data.getvalue())
+            if i:
+                asset.caption, asset.approved = "A colored sample image for training", True
+            assets.append(asset.id)
+        dataset_id = ds.id
+    return owner, member, assets[0], dataset_id, report_example()
+
+
+def test_analysis_review_and_training_lineage(platform):
+    import json
+    from img_creator.platform.vision_worker import analyze_one
+    from img_creator.platform.db import Asset, ImageAnalysis, VersionAnalysis, AnalysisReview, SchemaRevision
+
+    owner, member, asset_id, dataset_id, report = vision_fixture(platform)
+    url = f"/api/admin/assets/{asset_id}/analyze"
+    assert member.post(url, json={}).status_code == 403
+    first = owner.post(url, json={})
+    assert first.status_code == 202, first.text
+    analysis_id = first.json()["id"]
+    assert owner.post(url, json={}).json()["id"] == analysis_id
+
+    class Analyzer:
+        def analyze(self, image, mode):
+            assert image.size == (800, 800) and mode == "detail"
+            return json.dumps(report), {"input_tokens": 20, "output_tokens": 30}
+
+    assert analyze_one(platform[1], platform[2], Analyzer())
+    assert not analyze_one(platform[1], platform[2], Analyzer())
+    with platform[1].transaction() as s:
+        assert not s.get(Asset, asset_id).approved  # inference cannot approve training data
+        assert s.get(Asset, asset_id).caption == ""
+        assert s.get(SchemaRevision, 3)
+    data = owner.get(f"/api/admin/assets/{asset_id}/analyses").json()[0]
+    assert data["status"] == "succeeded" and data["metrics"]["output_tokens"] == 30
+    crop_url = f"/api/admin/analyses/{analysis_id}/regions/0"
+    assert member.get(crop_url).status_code == 403
+    assert Image.open(BytesIO(owner.get(crop_url).content)).size == (400, 480)
+    assert owner.get(crop_url[:-1] + "999").status_code == 404
+    report["visible_text"] = []  # owner corrects a hallucinated text proposal
+    caption = "A blue ceramic cup with a handle on a table."
+    reviewed = owner.post(f"/api/admin/analyses/{analysis_id}/approve", json={"report": report, "caption": caption})
+    assert reviewed.status_code == 200, reviewed.text
+    review_id = reviewed.json()["review_id"]
+    assert (
+        owner.get(f"/api/admin/assets/{asset_id}/analyses").json()[0]["latest_review"]["report"]["visible_text"] == []
+    )
+    assert owner.get(crop_url + "?review_id=" + review_id).status_code == 200
+    assert owner.get(crop_url + "?review_id=unknown").status_code == 404
+    run = owner.post("/api/admin/training", json={"dataset_id": dataset_id}).json()
+    with platform[1].transaction() as s:
+        training = s.get(TrainingRun, run["id"])
+        item = next(i for i in training.snapshot if i["id"] == asset_id)
+        assert item["analysis_review_id"] == review_id and item["caption"] == caption
+        assert s.get(VersionAnalysis, (training.config["dataset_version_id"], asset_id)).review_id == review_id
+        assert s.get(AnalysisReview, review_id).report["visible_text"] == []
+        assert s.get(ImageAnalysis, analysis_id).report["visible_text"]  # raw proposal is immutable
+    manifest = owner.get(f"/api/admin/dataset-versions/{training.config['dataset_version_id']}/manifest").json()
+    assert next(i for i in manifest if i["asset_id"] == asset_id)["analysis_review_id"] == review_id
+    assert owner.get(f"/api/admin/analyses/{analysis_id}/attempts").json()[0]["raw_output"]
+    assert owner.get("/api/admin/analysis-reviews/" + review_id).json()["caption"] == caption
+    assert member.get("/api/admin/analysis-reviews/" + review_id).status_code == 403
+    # Manual caption changes cannot carry an inaccurate link to the old review.
+    owner.patch(
+        f"/api/admin/assets/{asset_id}", json={"caption": "A manually rewritten training description", "approved": True}
+    )
+    new_run = owner.post("/api/admin/training", json={"dataset_id": dataset_id}).json()
+    with platform[1].transaction() as s:
+        new_snapshot = s.get(TrainingRun, new_run["id"]).snapshot
+        assert "analysis_review_id" not in next(i for i in new_snapshot if i["id"] == asset_id)
+        assert (
+            next(i for i in s.get(TrainingRun, run["id"]).snapshot if i["id"] == asset_id)["analysis_review_id"]
+            == review_id
+        )
+
+
+def test_invalid_analysis_and_retry_preserve_attempts(platform):
+    from img_creator.platform.vision_worker import analyze_one
+    from img_creator.platform.db import Asset, AnalysisAttempt
+
+    owner, _, asset_id, _, _ = vision_fixture(platform)
+    analysis_id = owner.post(f"/api/admin/assets/{asset_id}/analyze", json={}).json()["id"]
+
+    class Invalid:
+        def analyze(self, *_):
+            return '{"partial": true}', {}
+
+    for _ in range(2):
+        assert analyze_one(platform[1], platform[2], Invalid())
+        assert owner.post(f"/api/admin/analyses/{analysis_id}/retry").status_code == 200
+    with platform[1].transaction() as s:
+        assert not s.get(Asset, asset_id).approved
+        assert s.scalar(select(func.count()).select_from(AnalysisAttempt)) == 2
+    assert owner.post(f"/api/admin/analyses/{analysis_id}/retry").status_code == 409
+
+
+def test_analysis_corrupt_source_never_reaches_model(platform):
+    from img_creator.platform.vision_worker import analyze_one
+    from img_creator.platform.db import Asset, ImageAnalysis
+
+    owner, _, asset_id, _, _ = vision_fixture(platform)
+    analysis_id = owner.post(f"/api/admin/assets/{asset_id}/analyze", json={}).json()["id"]
+    with platform[1].transaction() as s:
+        key = s.get(Asset, asset_id).key
+    platform[2].put(key, b"changed")
+    analyze_one(platform[1], platform[2], object())
+    with platform[1].transaction() as s:
+        assert s.get(ImageAnalysis, analysis_id).status == "failed"
+
+
+def test_vision_lost_lease_cannot_publish(platform):
+    import json
+    from img_creator.platform.vision_worker import analyze_one
+    from img_creator.platform.db import ImageAnalysis
+
+    owner, _, asset_id, _, report = vision_fixture(platform)
+    analysis_id = owner.post(f"/api/admin/assets/{asset_id}/analyze", json={}).json()["id"]
+
+    class Superseded:
+        def analyze(self, *_):
+            with platform[1].transaction() as s:
+                s.get(ImageAnalysis, analysis_id).lease_token = "replacement-worker"
+            return json.dumps(report), {}
+
+    analyze_one(platform[1], platform[2], Superseded())
+    with platform[1].transaction() as s:
+        item = s.get(ImageAnalysis, analysis_id)
+        assert item.status == "running" and item.report is None
